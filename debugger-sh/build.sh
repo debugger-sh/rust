@@ -105,6 +105,11 @@ package_artifacts() {
 
   log "Packaging $BUILD_OUT/rustc.wasm and sysroot.tar.gz"
   cp -f "$rustc_src" "$BUILD_OUT/rustc.wasm"
+
+  log "Optimizing rustc.wasm... before=$(awk "BEGIN {printf \"%.1f\", $(stat -c%s "$BUILD_OUT/rustc.wasm")/1048576}") MiB"
+  wasm-opt -Os "$BUILD_OUT/rustc.wasm" -o "$BUILD_OUT/rustc.wasm.opt" && mv "$BUILD_OUT/rustc.wasm.opt" "$BUILD_OUT/rustc.wasm"
+  log "Finished optimizing... after=$(awk "BEGIN {printf \"%.1f\", $(stat -c%s "$BUILD_OUT/rustc.wasm")/1048576}") MiB"
+  
   local staging
   staging="$(mktemp -d)"
   mkdir -p "$staging/sysroot/lib"
