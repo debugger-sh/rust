@@ -1041,8 +1041,14 @@ impl Config {
                 target_config.entry(host_target).or_insert_with(|| Target::from_triple(triple));
             check_ci_llvm!(build_target.llvm_config);
             check_ci_llvm!(build_target.llvm_filecheck);
-            build_target.llvm_config = Some(ci_llvm_bin.join(exe("llvm-config", host_target)));
-            build_target.llvm_filecheck = Some(ci_llvm_bin.join(exe("FileCheck", host_target)));
+            if build_target.llvm_config.is_none() {
+                build_target.llvm_config =
+                    Some(ci_llvm_bin.join(exe("llvm-config", host_target)));
+            }
+            if build_target.llvm_filecheck.is_none() {
+                build_target.llvm_filecheck =
+                    Some(ci_llvm_bin.join(exe("FileCheck", host_target)));
+            }
         }
 
         for (target, linker_override) in default_linux_linker_overrides() {

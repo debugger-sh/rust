@@ -552,6 +552,43 @@ impl Step for Llvm {
 
         cfg.build();
 
+        // LLVM_BUILD_TOOLS=OFF skips installing llvm-config, but rustc_llvm still needs a
+        // wasm32-wasip1 llvm-config for --libdir/--libs (see debugger-sh/llvm-config-wasm.sh).
+        if target.contains("wasi") {
+            let build_dir = out_dir.join("build");
+            // CMake names the tool llvm-config; bootstrap's exe() adds .wasm for wasm targets.
+            let built_config = {
+                let with_exe_suffix = build_dir.join("bin").join(exe("llvm-config", target));
+                if with_exe_suffix.exists() {
+                    with_exe_suffix
+                } else {
+                    build_dir.join("bin").join("llvm-config")
+                }
+            };
+            let mut build_cfg = command("cmake");
+            build_cfg
+                .arg("--build")
+                .arg(&build_dir)
+                .arg("--target")
+                .arg("llvm-config")
+                .arg("--config")
+                .arg(profile);
+            if !env::var("MAKEFLAGS")
+                .map(|flags| flags.contains("--jobserver-auth=fifo:"))
+                .unwrap_or(false)
+            {
+                build_cfg.arg("--").arg("-j").arg(builder.jobs().to_string());
+            }
+            build_cfg.run(builder);
+            let install_bin = out_dir.join("bin");
+            t!(fs::create_dir_all(&install_bin));
+            // debugger-sh/llvm-config-wasm.sh and wasmer expect llvm-config (no .wasm suffix).
+            let installed_config = install_bin.join("llvm-config");
+            if built_config != installed_config {
+                t!(fs::copy(&built_config, &installed_config));
+            }
+        }
+
         // Helper to find the name of LLVM's shared library on darwin and linux.
         let find_llvm_lib_name = |extension| {
             let major = get_llvm_version_major(builder, &res.host_llvm_config);
@@ -696,6 +733,50 @@ fn configure_cmake(
             cfg.define("CMAKE_SYSTEM_NAME", "visionOS");
         } else if target.contains("watchos") {
             cfg.define("CMAKE_SYSTEM_NAME", "watchOS");
+        } else if target.contains("wasi") {
+            // WASI targets use the wasi-sdk toolchain but LLVM's build system expects a
+            // UNIX-like environment for lib/Support.
+            cfg.define("CMAKE_SYSTEM_NAME", "Linux");
+            cfg.define("CMAKE_BUILD_WITH_INSTALL_RPATH", "ON");
+            // The wasm-hosted rustc needs OS threads for codegen; preview1 is
+            // single-threaded, wasip1-threads enables them in LLVM/libcxx.
+            if target.contains("threads") {
+                cfg.define("LLVM_ENABLE_THREADS", "ON");
+            } else {
+                cfg.define("LLVM_ENABLE_THREADS", "OFF");
+            }
+            // WASI cannot link ELF shared objects (no --version-script, no .so).
+            cfg.define("LLVM_ENABLE_PIC", "OFF");
+            cfg.define("LLVM_LINK_LLVM_DYLIB", "OFF");
+            cfg.define("LLVM_BUILD_LLVM_DYLIB", "OFF");
+            // rustc only needs libLLVM + llvm-config on the wasm host, not fork-based tools.
+            cfg.define("LLVM_BUILD_TOOLS", "OFF");
+            cfg.define("LLVM_BUILD_UTILS", "OFF");
+            cfg.define("LLVM_INSTALL_UTILS", "OFF");
+            cfg.define("LLVM_TOOL_LLI_BUILD", "OFF");
+            cfg.define("LLVM_TOOL_LLVM_DRIVER_BUILD", "OFF");
+            cfg.define("LLVM_TOOL_LTO_BUILD", "OFF");
+            cfg.define("LLVM_TOOL_GOLD_BUILD", "OFF");
+            cfg.define("LLVM_TOOL_LLVM_JITLINK_BUILD", "OFF");
+            // Dummy-main fuzzers are built even with LLVM_BUILD_TOOLS=OFF; skip them on WASI.
+            for tool in [
+                "LLVM_AS_FUZZER",
+                "LLVM_DIS_FUZZER",
+                "LLVM_DLANG_DEMANGLE_FUZZER",
+                "LLVM_ITANIUM_DEMANGLE_FUZZER",
+                "LLVM_ISEL_FUZZER",
+                "LLVM_MC_ASSEMBLE_FUZZER",
+                "LLVM_MC_DISASSEMBLE_FUZZER",
+                "LLVM_MICROSOFT_DEMANGLE_FUZZER",
+                "LLVM_OPT_FUZZER",
+                "LLVM_RUST_DEMANGLE_FUZZER",
+                "LLVM_SPECIAL_CASE_LIST_FUZZER",
+                "LLVM_YAML_NUMERIC_PARSER_FUZZER",
+                "LLVM_YAML_PARSER_FUZZER",
+                "VFABI_DEMANGLE_FUZZER",
+            ] {
+                cfg.define(&format!("LLVM_TOOL_{tool}_BUILD"), "OFF");
+            }
         } else if target.contains("none") {
             // "none" should be the last branch
             cfg.define("CMAKE_SYSTEM_NAME", "Generic");
@@ -787,11 +868,14 @@ fn configure_cmake(
     //
     // Needs `suppressed_compiler_flag_prefixes` to be gone, and hence
     // https://github.com/llvm/llvm-project/issues/88780 to be fixed.
+    let skip_wasi_target_flag =
+        target.contains("wasi") && target.contains("threads");
     for flag in builder
         .cc_handled_clags(target, CLang::C)
         .into_iter()
         .chain(builder.cc_unhandled_cflags(target, GitRepo::Llvm, CLang::C))
         .filter(|flag| !suppressed_compiler_flag_prefixes.iter().any(|p| flag.starts_with(p)))
+        .filter(|flag| !(skip_wasi_target_flag && flag.starts_with("--target=")))
     {
         cflags.push(" ");
         cflags.push(flag);
@@ -802,6 +886,17 @@ fn configure_cmake(
     }
     if target.contains("ohos") {
         cflags.push(" -D_LINUX_SYSINFO_H");
+    }
+    if target.contains("wasi") {
+        // WASI SDK may not predefine `__wasi__` when LLVM sets CMAKE_SYSTEM_NAME=Linux.
+        cflags.push(" -D__wasi__");
+        cflags.push(
+            " -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL",
+        );
+        if target.contains("threads") {
+            cflags.push(" -matomics -mbulk-memory -mmutable-globals");
+            cflags.push(format!(" --target={target}"));
+        }
     }
     if builder.config.llvm_clang_cl.is_some() {
         cflags.push(format!(" --target={target}"));
@@ -817,6 +912,7 @@ fn configure_cmake(
                 .iter()
                 .any(|suppressed_prefix| flag.starts_with(suppressed_prefix))
         })
+        .filter(|flag| !(skip_wasi_target_flag && flag.starts_with("--target=")))
     {
         cxxflags.push(" ");
         cxxflags.push(flag);
@@ -827,6 +923,16 @@ fn configure_cmake(
     }
     if target.contains("ohos") {
         cxxflags.push(" -D_LINUX_SYSINFO_H");
+    }
+    if target.contains("wasi") {
+        cxxflags.push(" -D__wasi__");
+        cxxflags.push(
+            " -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL",
+        );
+        if target.contains("threads") {
+            cxxflags.push(" -matomics -mbulk-memory -mmutable-globals");
+            cxxflags.push(format!(" --target={target}"));
+        }
     }
     if builder.config.llvm_clang_cl.is_some() {
         cxxflags.push(format!(" --target={target}"));
@@ -855,6 +961,18 @@ fn configure_cmake(
 
     if let Some(flags) = get_var("LDFLAGS", &builder.config.host_target.triple, &target.triple) {
         ldflags.push_all(&flags);
+    }
+
+    if target.contains("wasi") {
+        let mut wasi_ldflags = String::from(
+            "-lwasi-emulated-mman -lwasi-emulated-process-clocks -lwasi-emulated-signal",
+        );
+        if target.contains("threads") {
+            wasi_ldflags.push_str(
+                " -Wl,--import-memory -Wl,--export-memory -Wl,--shared-memory -Wl,--max-memory=1073741824",
+            );
+        }
+        ldflags.push_all(&wasi_ldflags);
     }
 
     // For distribution we want the LLVM tools to be *statically* linked to libstdc++.

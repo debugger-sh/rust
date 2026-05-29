@@ -1442,7 +1442,12 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
         cargo.env("LLVM_OFFLOAD", "1");
     }
 
-    cargo.env("LLVM_CONFIG", &host_llvm_config);
+    let llvm_config = if target.triple.starts_with("wasm32-wasip") {
+        builder.src.join("debugger-sh/llvm-config-wasm.sh")
+    } else {
+        host_llvm_config
+    };
+    cargo.env("LLVM_CONFIG", &llvm_config);
 
     // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
     // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by
@@ -2480,9 +2485,12 @@ impl Step for Assemble {
                         // library sysroots, so that they are available for cg_gcc.
                         dylib_set.install_to(builder, target_compiler);
                     }
-                    CodegenBackendKind::Cranelift
-                    | CodegenBackendKind::Llvm
-                    | CodegenBackendKind::Custom(_) => continue,
+                    CodegenBackendKind::Cranelift => {
+                        let stamp = builder
+                            .ensure(CraneliftCodegenBackend { compilers: prepare_compilers() });
+                        copy_codegen_backends_to_sysroot(builder, stamp, target_compiler);
+                    }
+                    CodegenBackendKind::Llvm | CodegenBackendKind::Custom(_) => continue,
                 }
             }
         }

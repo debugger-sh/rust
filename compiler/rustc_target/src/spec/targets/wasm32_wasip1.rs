@@ -21,6 +21,23 @@ pub(crate) fn target() -> Target {
     options.os = Os::Wasi;
     options.env = Env::P1;
     options.add_pre_link_args(LinkerFlavor::WasmLld(Cc::Yes), &["--target=wasm32-wasip1"]);
+    // For the wasm-hosted rustc binary we need full static resolution; unresolved
+    // imports in `env` make Wasmer fail to instantiate `rustc.wasm`.
+    for args in options.pre_link_args.values_mut() {
+        args.retain(|arg| arg.as_ref() != "--allow-undefined" && arg.as_ref() != "-Wl,--allow-undefined");
+    }
+    options
+        .late_link_args
+        .entry(LinkerFlavor::WasmLld(Cc::Yes))
+        .or_default()
+        .extend([
+            "-lc++".into(),
+            "-lc++abi".into(),
+            "-ldl".into(),
+            "-lwasi-emulated-mman".into(),
+            "-lwasi-emulated-process-clocks".into(),
+            "-lwasi-emulated-signal".into(),
+        ]);
 
     options.pre_link_objects_self_contained = crt_objects::pre_wasi_self_contained();
     options.post_link_objects_self_contained = crt_objects::post_wasi_self_contained();
@@ -48,6 +65,7 @@ pub(crate) fn target() -> Target {
     // And, WASI mangles the name of "main" to distinguish between different
     // signatures.
     options.entry_name = "__main_void".into();
+    options.default_codegen_backend = Some("llvm".into());
 
     Target {
         llvm_target: "wasm32-wasip1".into(),

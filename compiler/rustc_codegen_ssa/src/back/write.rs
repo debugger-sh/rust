@@ -1,7 +1,8 @@
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::{assert_matches, fs, io, mem, str, thread};
 
@@ -132,7 +133,12 @@ impl ModuleConfig {
         let should_emit_obj = sess.opts.output_types.contains_key(&OutputType::Exe)
             || match kind {
                 ModuleKind::Regular => sess.opts.output_types.contains_key(&OutputType::Object),
-                ModuleKind::Allocator => false,
+                ModuleKind::Allocator => {
+                    // For wasm-hosted rustc, keep allocator objects so manual wasm-ld
+                    // flows can link allocator shims emitted by the compiler itself.
+                    cfg!(target_os = "wasi")
+                        && sess.opts.output_types.contains_key(&OutputType::Object)
+                }
             };
 
         let emit_obj = if !should_emit_obj {
@@ -445,6 +451,31 @@ pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
     let (shared_emitter, shared_emitter_main) = SharedEmitter::new();
     let (codegen_worker_send, codegen_worker_receive) = channel();
 
+    if cfg!(target_os = "wasi") {
+        wasi_progress("start_async_codegen: using SyncCodegen");
+        let sync = SyncCodegen::new(
+            &backend,
+            tcx,
+            crate_info,
+            shared_emitter,
+            Arc::new(regular_config),
+            Arc::new(allocator_config),
+            allocator_module,
+        );
+        return OngoingCodegen {
+            backend,
+            codegen_worker_receive,
+            shared_emitter_main,
+            coordinator: Coordinator {
+                sender: coordinator_send,
+                future: None,
+                sync: Some(Mutex::new(sync)),
+                phantom: PhantomData,
+            },
+            output_filenames: Arc::clone(tcx.output_filenames(())),
+        };
+    }
+
     let coordinator_thread = start_executing_work(
         backend.clone(),
         tcx,
@@ -466,6 +497,7 @@ pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
         coordinator: Coordinator {
             sender: coordinator_send,
             future: Some(coordinator_thread),
+            sync: None,
             phantom: PhantomData,
         },
         output_filenames: Arc::clone(tcx.output_filenames(())),
@@ -821,12 +853,20 @@ pub(crate) fn compute_per_cgu_lto_type(
     }
 }
 
+fn wasi_progress(msg: &str) {
+    if cfg!(target_os = "wasi") {
+        let _ = writeln!(io::stderr(), "[rustc-codegen-wasi] {msg}");
+        let _ = io::stderr().flush();
+    }
+}
+
 fn execute_optimize_work_item<B: WriteBackendMethods>(
     cgcx: &CodegenContext,
     prof: &SelfProfilerRef,
     shared_emitter: SharedEmitter,
     mut module: ModuleCodegen<B::Module>,
 ) -> WorkItemResult<B> {
+    wasi_progress(&format!("execute_optimize_work_item start {}", module.name));
     let _timer = prof.generic_activity_with_arg("codegen_module_optimize", &*module.name);
 
     B::optimize(cgcx, prof, &shared_emitter, &mut module, &cgcx.module_config);
@@ -850,7 +890,9 @@ fn execute_optimize_work_item<B: WriteBackendMethods>(
 
     match lto_type {
         ComputedLtoType::No => {
+            wasi_progress(&format!("execute_optimize_work_item codegen {}", module.name));
             let module = B::codegen(cgcx, &prof, &shared_emitter, module, &cgcx.module_config);
+            wasi_progress(&format!("execute_optimize_work_item done {}", module.name));
             WorkItemResult::Finished(module)
         }
         ComputedLtoType::Thin => {
@@ -1017,6 +1059,31 @@ fn do_thin_lto<B: WriteBackendMethods>(
     let dcx = dcx.handle();
 
     check_lto_allowed(&cgcx, dcx);
+
+    if !cgcx.parallel {
+        wasi_progress("do_thin_lto sequential");
+        let mut compiled_modules = Vec::new();
+        for (work, _) in generate_thin_lto_work::<B>(
+            cgcx,
+            prof,
+            dcx,
+            &exported_symbols_for_lto,
+            &each_linked_rlib_for_lto,
+            needs_thin_lto,
+            lto_import_only_modules,
+        ) {
+            let module = match work {
+                ThinLtoWorkItem::CopyPostLtoArtifacts(m) => {
+                    execute_copy_from_cache_work_item(cgcx, prof, shared_emitter.clone(), m)
+                }
+                ThinLtoWorkItem::ThinLto(m) => {
+                    execute_thin_lto_work_item(cgcx, prof, shared_emitter.clone(), tm_factory.clone(), m)
+                }
+            };
+            compiled_modules.push(module);
+        }
+        return compiled_modules;
+    }
 
     let (coordinator_send, coordinator_receive) = channel();
 
@@ -1245,6 +1312,247 @@ enum MainThreadState {
 
     /// Idle, but lending the compiler process's Token to an LLVM thread so it can do useful work.
     Lending,
+}
+
+/// Inline LLVM coordinator for hosts without threads (e.g. wasm32-wasip1).
+struct SyncCodegen<B: WriteBackendMethods> {
+    cgcx: CodegenContext,
+    prof: SelfProfilerRef,
+    shared_emitter: SharedEmitter,
+    tm_factory: TargetMachineFactoryFn<B>,
+    exported_symbols_for_lto: Arc<Vec<String>>,
+    each_linked_rlib_file_for_lto: Vec<PathBuf>,
+    allocator_module: Option<ModuleCodegen<B::Module>>,
+    allocator_config: Arc<ModuleConfig>,
+    allocator_compiled: Option<CompiledModule>,
+    compiled_modules: Vec<CompiledModule>,
+    needs_fat_lto: Vec<FatLtoInput<B>>,
+    needs_thin_lto: Vec<(String, B::ModuleBuffer)>,
+    lto_import_only_modules:
+        Vec<(SerializedModule<B::ModuleBuffer>, WorkProduct)>,
+}
+
+impl<B: WriteBackendMethods> SyncCodegen<B> {
+    fn new(
+        backend: &B,
+        tcx: TyCtxt<'_>,
+        crate_info: &CrateInfo,
+        shared_emitter: SharedEmitter,
+        regular_config: Arc<ModuleConfig>,
+        allocator_config: Arc<ModuleConfig>,
+        mut allocator_module: Option<ModuleCodegen<B::Module>>,
+    ) -> Self {
+        wasi_progress("SyncCodegen::new");
+        let sess = tcx.sess;
+        let prof = sess.prof.clone();
+
+        let mut each_linked_rlib_for_lto = Vec::new();
+        let mut each_linked_rlib_file_for_lto = Vec::new();
+        drop(link::each_linked_rlib(crate_info, None, &mut |cnum, path| {
+            if link::ignored_for_lto(sess, crate_info, cnum) {
+                return;
+            }
+            each_linked_rlib_for_lto.push(cnum);
+            each_linked_rlib_file_for_lto.push(path.to_path_buf());
+        }));
+
+        let exported_symbols_for_lto =
+            Arc::new(lto::exported_symbols_for_lto(tcx, &each_linked_rlib_for_lto));
+
+        let opt_level = tcx.backend_optimization_level(());
+        let backend_features = tcx.global_backend_features(()).clone();
+        let tm_factory = backend.target_machine_factory(tcx.sess, opt_level, &backend_features);
+
+        let remark_dir = if let Some(ref dir) = sess.opts.unstable_opts.remark_dir {
+            let result = fs::create_dir_all(dir).and_then(|_| dir.canonicalize());
+            match result {
+                Ok(dir) => Some(dir),
+                Err(error) => sess.dcx().emit_fatal(ErrorCreatingRemarkDir { error }),
+            }
+        } else {
+            None
+        };
+
+        let cgcx = CodegenContext {
+            crate_types: tcx.crate_types().to_vec(),
+            lto: sess.lto(),
+            use_linker_plugin_lto: sess.opts.cg.linker_plugin_lto.enabled(),
+            dylib_lto: sess.opts.unstable_opts.dylib_lto,
+            prefer_dynamic: sess.opts.cg.prefer_dynamic,
+            fewer_names: sess.fewer_names(),
+            save_temps: sess.opts.cg.save_temps,
+            time_trace: sess.opts.unstable_opts.llvm_time_trace,
+            remark: sess.opts.cg.remark.clone(),
+            remark_dir,
+            incr_comp_session_dir: sess.incr_comp_session_dir_opt().map(|r| r.clone()),
+            output_filenames: Arc::clone(tcx.output_filenames(())),
+            module_config: regular_config,
+            opt_level,
+            backend_features,
+            msvc_imps_needed: msvc_imps_needed(tcx),
+            is_pe_coff: tcx.sess.target.is_like_windows,
+            target_can_use_split_dwarf: tcx.sess.target_can_use_split_dwarf(),
+            target_arch: tcx.sess.target.arch.to_string(),
+            target_is_like_darwin: tcx.sess.target.is_like_darwin,
+            target_is_like_aix: tcx.sess.target.is_like_aix,
+            target_is_like_gpu: tcx.sess.target.is_like_gpu,
+            split_debuginfo: tcx.sess.split_debuginfo(),
+            split_dwarf_kind: tcx.sess.opts.unstable_opts.split_dwarf_kind,
+            parallel: false,
+            pointer_size: tcx.data_layout.pointer_size(),
+            invocation_temp: sess.invocation_temp.clone(),
+        };
+
+        let mut allocator_compiled = None;
+        let mut allocator_module = if let Some(mut allocator_module) = allocator_module {
+            wasi_progress("SyncCodegen allocator optimize");
+            B::optimize(
+                &cgcx,
+                &prof,
+                &shared_emitter,
+                &mut allocator_module,
+                &allocator_config,
+            );
+            if cgcx.lto == Lto::No {
+                wasi_progress("SyncCodegen allocator codegen");
+                allocator_compiled = Some(B::codegen(
+                    &cgcx,
+                    &prof,
+                    &shared_emitter,
+                    allocator_module,
+                    &allocator_config,
+                ));
+                None
+            } else {
+                Some(allocator_module)
+            }
+        } else {
+            None
+        };
+
+        Self {
+            cgcx,
+            prof,
+            shared_emitter,
+            tm_factory,
+            exported_symbols_for_lto,
+            each_linked_rlib_file_for_lto,
+            allocator_module,
+            allocator_config,
+            allocator_compiled,
+            compiled_modules: vec![],
+            needs_fat_lto: vec![],
+            needs_thin_lto: vec![],
+            lto_import_only_modules: vec![],
+        }
+    }
+
+    fn apply_work_item_result(&mut self, result: WorkItemResult<B>) {
+        match result {
+            WorkItemResult::Finished(compiled_module) => {
+                wasi_progress(&format!("compiled module {}", compiled_module.name));
+                self.compiled_modules.push(compiled_module);
+            }
+            WorkItemResult::NeedsFatLto(fat_lto_input) => {
+                assert!(self.needs_thin_lto.is_empty());
+                self.needs_fat_lto.push(fat_lto_input);
+            }
+            WorkItemResult::NeedsThinLto(name, thin_buffer) => {
+                assert!(self.needs_fat_lto.is_empty());
+                self.needs_thin_lto.push((name, thin_buffer));
+            }
+        }
+    }
+
+    fn process_work_item(&mut self, llvm_work_item: WorkItem<B>) {
+        let result = match llvm_work_item {
+            WorkItem::Optimize(module) => execute_optimize_work_item(
+                &self.cgcx,
+                &self.prof,
+                self.shared_emitter.clone(),
+                module,
+            ),
+            WorkItem::CopyPostLtoArtifacts(module) => WorkItemResult::Finished(
+                execute_copy_from_cache_work_item(
+                    &self.cgcx,
+                    &self.prof,
+                    self.shared_emitter.clone(),
+                    module,
+                ),
+            ),
+        };
+        self.apply_work_item_result(result);
+    }
+
+    fn add_import_only_module(
+        &mut self,
+        module_data: SerializedModule<B::ModuleBuffer>,
+        work_product: WorkProduct,
+    ) {
+        self.lto_import_only_modules.push((module_data, work_product));
+    }
+
+    fn finish(mut self) -> Result<MaybeLtoModules<B>, ()> {
+        wasi_progress("SyncCodegen::finish start");
+
+        if !self.needs_fat_lto.is_empty() {
+            assert!(self.compiled_modules.is_empty());
+            assert!(self.needs_thin_lto.is_empty());
+
+            if let Some(allocator_module) = self.allocator_module.take() {
+                self.needs_fat_lto.push(FatLtoInput::InMemory(allocator_module));
+            }
+
+            wasi_progress("SyncCodegen::finish fat LTO");
+            return Ok(MaybeLtoModules::FatLto {
+                cgcx: self.cgcx,
+                exported_symbols_for_lto: self.exported_symbols_for_lto,
+                each_linked_rlib_file_for_lto: self.each_linked_rlib_file_for_lto,
+                needs_fat_lto: self.needs_fat_lto,
+                lto_import_only_modules: self.lto_import_only_modules,
+            });
+        }
+
+        if !self.needs_thin_lto.is_empty() || !self.lto_import_only_modules.is_empty() {
+            assert!(self.compiled_modules.is_empty());
+            assert!(self.needs_fat_lto.is_empty());
+
+            if self.cgcx.lto == Lto::ThinLocal {
+                wasi_progress("SyncCodegen::finish thin LTO");
+                self.compiled_modules.extend(do_thin_lto::<B>(
+                    &self.cgcx,
+                    &self.prof,
+                    self.shared_emitter.clone(),
+                    self.tm_factory,
+                    self.exported_symbols_for_lto,
+                    self.each_linked_rlib_file_for_lto,
+                    self.needs_thin_lto,
+                    self.lto_import_only_modules,
+                ));
+            } else {
+                bug!("all LTO module buffers are empty");
+            }
+        }
+
+        let allocator_module = self.allocator_compiled.or_else(|| {
+            self.allocator_module.map(|allocator_module| {
+                wasi_progress("SyncCodegen allocator codegen (deferred)");
+                B::codegen(
+                    &self.cgcx,
+                    &self.prof,
+                    &self.shared_emitter,
+                    allocator_module,
+                    &self.allocator_config,
+                )
+            })
+        });
+
+        wasi_progress("SyncCodegen::finish done");
+        Ok(MaybeLtoModules::NoLto(CompiledModules {
+            modules: self.compiled_modules,
+            allocator_module,
+        }))
+    }
 }
 
 fn start_executing_work<B: ExtraBackendMethods>(
@@ -2111,18 +2419,30 @@ impl SharedEmitterMain {
 pub struct Coordinator<B: WriteBackendMethods> {
     sender: Sender<Message<B>>,
     future: Option<thread::JoinHandle<Result<MaybeLtoModules<B>, ()>>>,
+    sync: Option<Mutex<SyncCodegen<B>>>,
     // Only used for the Message type.
     phantom: PhantomData<B>,
 }
 
 impl<B: WriteBackendMethods> Coordinator<B> {
+    fn is_sync(&self) -> bool {
+        self.sync.is_some()
+    }
+
     fn join(mut self) -> std::thread::Result<Result<MaybeLtoModules<B>, ()>> {
+        if let Some(sync) = self.sync.take() {
+            wasi_progress("Coordinator::join sync path");
+            return Ok(sync.into_inner().expect("sync coordinator poisoned").finish());
+        }
         self.future.take().unwrap().join()
     }
 }
 
 impl<B: WriteBackendMethods> Drop for Coordinator<B> {
     fn drop(&mut self) {
+        if self.sync.is_some() {
+            return;
+        }
         if let Some(future) = self.future.take() {
             // If we haven't joined yet, signal to the coordinator that it should spawn no more
             // work, and wait for worker threads to finish.
@@ -2145,7 +2465,15 @@ pub struct OngoingCodegen<B: WriteBackendMethods> {
 
 impl<B: WriteBackendMethods> OngoingCodegen<B> {
     pub fn join(self, sess: &Session) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
-        self.shared_emitter_main.check(sess, true);
+        wasi_progress("OngoingCodegen::join start");
+        // In synchronous mode, the coordinator (and its SharedEmitter clone) lives in this
+        // thread. Calling `check(..., true)` here would wait for channel closure before we've
+        // run `coordinator.join()`, deadlocking. Do a non-blocking check first instead.
+        if self.coordinator.is_sync() {
+            self.shared_emitter_main.check(sess, false);
+        } else {
+            self.shared_emitter_main.check(sess, true);
+        }
 
         let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
             Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
@@ -2238,15 +2566,19 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
 
         let work_products =
             copy_all_cgu_workproducts_to_incr_comp_cache_dir(sess, &compiled_modules);
+        wasi_progress("produce_final_output_artifacts");
         produce_final_output_artifacts(sess, &compiled_modules, &self.output_filenames);
+        wasi_progress("join complete");
 
         (compiled_modules, work_products)
     }
 
     pub(crate) fn codegen_finished(&self, tcx: TyCtxt<'_>) {
-        self.wait_for_signal_to_codegen_item();
+        if !self.coordinator.is_sync() {
+            self.wait_for_signal_to_codegen_item();
+            drop(self.coordinator.sender.send(Message::CodegenComplete::<B>));
+        }
         self.check_for_errors(tcx.sess);
-        drop(self.coordinator.sender.send(Message::CodegenComplete::<B>));
     }
 
     pub(crate) fn check_for_errors(&self, sess: &Session) {
@@ -2254,6 +2586,9 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
     }
 
     pub(crate) fn wait_for_signal_to_codegen_item(&self) {
+        if self.coordinator.is_sync() {
+            return;
+        }
         match self.codegen_worker_receive.recv() {
             Ok(CguMessage) => {
                 // Ok to proceed.
@@ -2272,6 +2607,12 @@ pub(crate) fn submit_codegened_module_to_llvm<B: WriteBackendMethods>(
     cost: u64,
 ) {
     let llvm_work_item = WorkItem::Optimize(module);
+    if let Some(sync) = &coordinator.sync {
+        wasi_progress("submit_codegened_module_to_llvm");
+        sync.lock().expect("sync coordinator poisoned").process_work_item(llvm_work_item);
+        let _ = cost;
+        return;
+    }
     drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost }));
 }
 
@@ -2280,6 +2621,10 @@ pub(crate) fn submit_post_lto_module_to_llvm<B: WriteBackendMethods>(
     module: CachedModuleCodegen,
 ) {
     let llvm_work_item = WorkItem::CopyPostLtoArtifacts(module);
+    if let Some(sync) = &coordinator.sync {
+        sync.lock().expect("sync coordinator poisoned").process_work_item(llvm_work_item);
+        return;
+    }
     drop(coordinator.sender.send(Message::CodegenDone::<B> { llvm_work_item, cost: 0 }));
 }
 
@@ -2298,11 +2643,16 @@ pub(crate) fn submit_pre_lto_module_to_llvm<B: WriteBackendMethods>(
             panic!("failed to mmap bitcode file `{}`: {}", bc_path.display(), e)
         })
     };
+    let module_data = SerializedModule::FromUncompressedFile(mmap);
+    let work_product = module.source;
+    if let Some(sync) = &coordinator.sync {
+        sync.lock()
+            .expect("sync coordinator poisoned")
+            .add_import_only_module(module_data, work_product);
+        return;
+    }
     // Schedule the module to be loaded
-    drop(coordinator.sender.send(Message::AddImportOnlyModule::<B> {
-        module_data: SerializedModule::FromUncompressedFile(mmap),
-        work_product: module.source,
-    }));
+    drop(coordinator.sender.send(Message::AddImportOnlyModule::<B> { module_data, work_product }));
 }
 
 fn pre_lto_bitcode_filename(module_name: &str) -> String {

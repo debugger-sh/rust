@@ -88,6 +88,7 @@ pub(crate) enum LLVMRustVerifierFailureAction {
 
 pub(crate) use self::Enzyme_AD::*;
 
+#[cfg(any(unix, windows))]
 pub(crate) mod Enzyme_AD {
     use std::ffi::{c_char, c_void};
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -464,6 +465,115 @@ pub(crate) mod Enzyme_AD {
     }
 }
 
+// libloading only supports unix/windows; wasm-hosted rustc does not need Enzyme.
+#[cfg(not(any(unix, windows)))]
+pub(crate) mod Enzyme_AD {
+    use std::ffi::{c_char, c_void};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use rustc_session::config::Sysroot;
+
+    use super::{CConcreteType, CTypeTreeRef, Context};
+
+    #[allow(non_snake_case)]
+    pub(crate) struct EnzymeWrapper {
+        pub registerEnzymeAndPassPipeline: *const c_void,
+    }
+
+    unsafe impl Sync for EnzymeWrapper {}
+    unsafe impl Send for EnzymeWrapper {}
+
+    static ENZYME_INSTANCE: OnceLock<Mutex<EnzymeWrapper>> = OnceLock::new();
+
+    #[derive(Debug)]
+    pub(crate) enum EnzymeLibraryError {
+        NotFound { err: String },
+        LoadFailed { err: String },
+    }
+
+    impl EnzymeWrapper {
+        pub(crate) fn get_or_init(
+            _sysroot: &Sysroot,
+        ) -> Result<MutexGuard<'static, Self>, EnzymeLibraryError> {
+            Err(EnzymeLibraryError::NotFound {
+                err: "Enzyme is not available on this platform".to_string(),
+            })
+        }
+
+        pub(crate) fn get_instance() -> MutexGuard<'static, Self> {
+            ENZYME_INSTANCE
+                .get_or_init(|| {
+                    Mutex::new(EnzymeWrapper { registerEnzymeAndPassPipeline: std::ptr::null() })
+                })
+                .lock()
+                .unwrap()
+        }
+
+        pub(crate) fn new_type_tree(&self) -> CTypeTreeRef {
+            std::ptr::null_mut()
+        }
+
+        pub(crate) fn new_type_tree_ct(
+            &self,
+            _t: CConcreteType,
+            _ctx: &Context,
+        ) -> *mut super::EnzymeTypeTree {
+            std::ptr::null_mut()
+        }
+
+        pub(crate) fn new_type_tree_tr(&self, _tree: CTypeTreeRef) -> CTypeTreeRef {
+            std::ptr::null_mut()
+        }
+
+        pub(crate) fn free_type_tree(&self, _tree: CTypeTreeRef) {}
+
+        pub(crate) fn merge_type_tree(&self, _tree1: CTypeTreeRef, _tree2: CTypeTreeRef) -> bool {
+            true
+        }
+
+        pub(crate) fn tree_only_eq(&self, _tree: CTypeTreeRef, _num: i64) {}
+
+        pub(crate) fn tree_data0_eq(&self, _tree: CTypeTreeRef) {}
+
+        pub(crate) fn shift_indicies_eq(
+            &self,
+            _tree: CTypeTreeRef,
+            _data_layout: *const c_char,
+            _offset: i64,
+            _max_size: i64,
+            _add_offset: u64,
+        ) {
+        }
+
+        pub(crate) fn tree_insert_eq(
+            &self,
+            _tree: CTypeTreeRef,
+            _indices: *const i64,
+            _len: usize,
+            _ct: CConcreteType,
+            _ctx: &Context,
+        ) {
+        }
+
+        pub(crate) fn tree_to_string(&self, _tree: *mut super::EnzymeTypeTree) -> *const c_char {
+            std::ptr::null()
+        }
+
+        pub(crate) fn tree_to_string_free(&self, _ch: *const c_char) {}
+
+        pub(crate) fn set_print_perf(&mut self, _print: bool) {}
+        pub(crate) fn set_print_activity(&mut self, _print: bool) {}
+        pub(crate) fn set_print_type(&mut self, _print: bool) {}
+        pub(crate) fn set_print_type_fun(&mut self, _fun_name: &str) {}
+        pub(crate) fn set_print(&mut self, _print: bool) {}
+        pub(crate) fn set_strict_aliasing(&mut self, _strict: bool) {}
+        pub(crate) fn set_loose_types(&mut self, _loose: bool) {}
+        pub(crate) fn set_inline(&mut self, _val: bool) {}
+        pub(crate) fn set_rust_rules(&mut self, _val: bool) {}
+    }
+}
+
+#[cfg(any(unix, windows))]
 impl TypeTree {
     pub(crate) fn new() -> TypeTree {
         let wrapper = EnzymeWrapper::get_instance();
@@ -511,6 +621,7 @@ impl TypeTree {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Clone for TypeTree {
     fn clone(&self) -> Self {
         let wrapper = EnzymeWrapper::get_instance();
@@ -519,6 +630,7 @@ impl Clone for TypeTree {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl std::fmt::Display for TypeTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let wrapper = EnzymeWrapper::get_instance();
@@ -536,15 +648,65 @@ impl std::fmt::Display for TypeTree {
     }
 }
 
+#[cfg(any(unix, windows))]
 impl std::fmt::Debug for TypeTree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         <Self as std::fmt::Display>::fmt(self, f)
     }
 }
 
+#[cfg(any(unix, windows))]
 impl Drop for TypeTree {
     fn drop(&mut self) {
         let wrapper = EnzymeWrapper::get_instance();
         wrapper.free_type_tree(self.inner)
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl TypeTree {
+    pub(crate) fn new() -> TypeTree {
+        TypeTree { inner: std::ptr::null_mut() }
+    }
+
+    pub(crate) fn from_type(_t: CConcreteType, _ctx: &Context) -> TypeTree {
+        TypeTree { inner: std::ptr::null_mut() }
+    }
+
+    pub(crate) fn merge(self, _other: Self) -> Self {
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn shift(self, _layout: &str, _offset: isize, _max_size: isize, _add_offset: usize) -> Self {
+        self
+    }
+
+    pub(crate) fn insert(&mut self, _indices: &[i64], _ct: CConcreteType, _ctx: &Context) {}
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Clone for TypeTree {
+    fn clone(&self) -> Self {
+        TypeTree { inner: self.inner }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl std::fmt::Display for TypeTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<typetree unavailable>")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl std::fmt::Debug for TypeTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "TypeTree {{ .. }}")
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+impl Drop for TypeTree {
+    fn drop(&mut self) {}
 }

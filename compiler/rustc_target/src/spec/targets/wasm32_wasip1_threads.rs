@@ -32,6 +32,21 @@ pub(crate) fn target() -> Target {
             "-Wl,--max-memory=1073741824",
         ],
     );
+    for args in options.pre_link_args.values_mut() {
+        args.retain(|arg| arg.as_ref() != "--allow-undefined" && arg.as_ref() != "-Wl,--allow-undefined");
+    }
+    options
+        .late_link_args
+        .entry(LinkerFlavor::WasmLld(Cc::Yes))
+        .or_default()
+        .extend([
+            "-lc++".into(),
+            "-lc++abi".into(),
+            "-ldl".into(),
+            "-lwasi-emulated-mman".into(),
+            "-lwasi-emulated-process-clocks".into(),
+            "-lwasi-emulated-signal".into(),
+        ]);
 
     options.pre_link_objects_self_contained = crt_objects::pre_wasi_self_contained();
     options.post_link_objects_self_contained = crt_objects::post_wasi_self_contained();
@@ -62,6 +77,7 @@ pub(crate) fn target() -> Target {
 
     options.singlethread = false;
     options.features = "+atomics,+bulk-memory,+mutable-globals".into();
+    options.default_codegen_backend = Some("llvm".into());
 
     Target {
         llvm_target: "wasm32-wasi".into(),

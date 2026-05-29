@@ -796,7 +796,13 @@ impl Session {
     /// compilation
     #[inline]
     pub fn threads(&self) -> usize {
-        self.opts.unstable_opts.threads
+        // WASI preview1 has no threads; a wasm-hosted rustc must not spawn query
+        // or codegen worker threads even if the user passes `-Zthreads=N`.
+        if cfg!(target_os = "wasi") {
+            1
+        } else {
+            self.opts.unstable_opts.threads
+        }
     }
 
     /// Returns the number of codegen units that should be used for this

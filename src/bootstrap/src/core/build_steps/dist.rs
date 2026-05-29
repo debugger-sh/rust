@@ -2543,6 +2543,9 @@ pub fn maybe_install_llvm_target(builder: &Builder<'_>, target: TargetSelection,
     // We do not need to copy LLVM files into the sysroot if it is not
     // dynamically linked; it is already included into librustc_llvm
     // statically.
+    if target == "wasm32-wasip1" {
+        return;
+    }
     if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir, false);
     }
@@ -2567,6 +2570,9 @@ pub fn maybe_install_llvm_runtime(builder: &Builder<'_>, target: TargetSelection
     // We do not need to copy LLVM files into the sysroot if it is not
     // dynamically linked; it is already included into librustc_llvm
     // statically.
+    if target == "wasm32-wasip1" {
+        return;
+    }
     if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir, false);
     }

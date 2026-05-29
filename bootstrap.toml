@@ -4,6 +4,7 @@ change-id = 9999999
 
 [llvm]
 download-ci-llvm = true
+link-shared = true
 
 [rust]
 codegen-backends = ["llvm"]
@@ -17,8 +18,10 @@ debuginfo-level = 0
 docs = false
 extended = false
 tools = []
+submodules = false
+build = "x86_64-unknown-linux-gnu"
 host = ["wasm32-wasip1"]
-target = ["x86_64-unknown-linux-gnu"]
+target = ["wasm32-wasip1"]
 
 [install]
 prefix = "dist"
@@ -27,7 +30,7 @@ sysconfdir = "etc"
 [target.'wasm32-wasip1']
 wasi-root = "wasi-sdk-32.0-x86_64-linux/share/wasi-sysroot"
 linker = "wasi-sdk-32.0-x86_64-linux/bin/clang"
-codegen-backends = ["cranelift"]
+codegen-backends = ["llvm"]
 
 [target.'wasm32-wasip1-threads']
 wasi-root = "wasi-sdk-32.0-x86_64-linux/share/wasi-sysroot"

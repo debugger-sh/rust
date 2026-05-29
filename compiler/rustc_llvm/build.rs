@@ -179,6 +179,7 @@ fn main() {
     let llvm_config =
         PathBuf::from(tracked_env_var_os("LLVM_CONFIG").expect("LLVM_CONFIG was not set"));
 
+    println!("cargo:warning=using LLVM_CONFIG={}", llvm_config.display());
     println!("cargo:rerun-if-changed={}", llvm_config.display());
 
     // FIXME: `--quote-paths` was added to llvm-config in LLVM 22, so this test (and all its ensuing
@@ -483,8 +484,8 @@ fn main() {
         println!("cargo:rustc-link-lib=atomic");
     }
 
-    // C++ runtime library
-    if !target.contains("msvc") {
+    // C++ runtime library (WASI SDK LLVM is linked as a single shared library).
+    if !target.contains("msvc") && !target.contains("wasi") {
         if let Some(s) = llvm_static_stdcpp {
             assert!(cxxflags.into_iter().all(|flag| flag != "-stdlib=libc++"));
             let path = PathBuf::from(s);

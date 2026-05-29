@@ -1,0 +1,54 @@
+name: debugger-sh
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Build container image
+        run: docker build -f debugger-sh/Dockerfile -t debugger-sh-build .
+
+      - name: Build rustc.wasm and sysroot
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/rust" \
+            -w /rust \
+            debugger-sh-build \
+            /rust/debugger-sh/build.sh
+
+      - name: Test artifacts
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/rust" \
+            -w /rust \
+            debugger-sh-build \
+            /rust/debugger-sh/test.sh
+
+      - name: Create GitHub release
+        if: success() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="debugger-sh-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" \
+            --title "wasm32-wasip1 rustc (${TAG})" \
+            --notes "Automated build from debugger-sh workflow." \
+            debugger-sh/build/rustc.wasm \
+            debugger-sh/build/sysroot.tar.gz

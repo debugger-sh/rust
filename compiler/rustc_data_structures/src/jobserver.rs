@@ -138,12 +138,21 @@ impl Proxy {
             assert_eq!(data.pending, 0);
             data.used += 1;
         } else {
-            // Request a token from the helper thread. We can't directly use `acquire_raw`
-            // as we also need to be able to wait for the final token in the process which
-            // does not get a corresponding `release_raw` call.
-            self.helper.get().unwrap().request_token();
-            data.pending += 1;
-            self.wake_pending.wait(&mut data);
+            #[cfg(target_os = "wasi")]
+            {
+                // No helper thread on WASI preview1; single-threaded hosts reuse the
+                // implicit process token instead of blocking forever.
+                data.used += 1;
+            }
+            #[cfg(not(target_os = "wasi"))]
+            {
+                // Request a token from the helper thread. We can't directly use `acquire_raw`
+                // as we also need to be able to wait for the final token in the process which
+                // does not get a corresponding `release_raw` call.
+                self.helper.get().unwrap().request_token();
+                data.pending += 1;
+                self.wake_pending.wait(&mut data);
+            }
         }
     }
 

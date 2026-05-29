@@ -28,7 +28,9 @@ static INIT: Once = Once::new();
 pub(crate) fn init(sess: &Session) {
     unsafe {
         // Before we touch LLVM, make sure that multithreading is enabled.
-        if !llvm::LLVMIsMultithreaded().is_true() {
+        if !llvm::LLVMIsMultithreaded().is_true()
+            && !(sess.target.arch == Arch::Wasm32 && sess.target.os == Os::Wasi)
+        {
             bug!("LLVM compiled without support for threads");
         }
         INIT.call_once(|| {
