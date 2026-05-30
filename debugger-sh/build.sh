@@ -56,7 +56,7 @@ install_rustc() {
   cd "$ROOT"
   local stage0="$(grep '^compiler_git_commit_hash=' src/stage0 | cut -d= -f2)"
   git cat-file -e "${stage0}^{commit}" 2>/dev/null || git fetch "$RUST_UPSTREAM" "$stage0" --depth=1
-  git fetch origin --deepen=256
+  git fetch origin --deepen=256 --no-recurse-submodules
   log "Installing rustc (wasm32-wasip1 host, LLVM codegen)"
   ./x.py install -j "$(nproc)"
 }
