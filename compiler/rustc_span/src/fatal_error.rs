@@ -13,6 +13,11 @@ impl !Send for FatalError {}
 
 impl FatalError {
     pub fn raise(self) -> ! {
+        // wasm32-wasip1 defaults to panic=abort, so resume_unwind traps instead of reaching
+        // catch_fatal_errors in the driver. Use a normal process exit on WASI.
+        if cfg!(target_os = "wasi") {
+            std::process::exit(1);
+        }
         std::panic::resume_unwind(Box::new(FatalErrorMarker))
     }
 }

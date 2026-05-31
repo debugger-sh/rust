@@ -1,7 +1,6 @@
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::{assert_matches, fs, io, mem, str, thread};
@@ -452,7 +451,6 @@ pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
     let (codegen_worker_send, codegen_worker_receive) = channel();
 
     if cfg!(target_os = "wasi") {
-        wasi_progress("start_async_codegen: using SyncCodegen");
         let sync = SyncCodegen::new(
             &backend,
             tcx,
@@ -853,20 +851,12 @@ pub(crate) fn compute_per_cgu_lto_type(
     }
 }
 
-fn wasi_progress(msg: &str) {
-    if cfg!(target_os = "wasi") {
-        let _ = writeln!(io::stderr(), "[rustc-codegen-wasi] {msg}");
-        let _ = io::stderr().flush();
-    }
-}
-
 fn execute_optimize_work_item<B: WriteBackendMethods>(
     cgcx: &CodegenContext,
     prof: &SelfProfilerRef,
     shared_emitter: SharedEmitter,
     mut module: ModuleCodegen<B::Module>,
 ) -> WorkItemResult<B> {
-    wasi_progress(&format!("execute_optimize_work_item start {}", module.name));
     let _timer = prof.generic_activity_with_arg("codegen_module_optimize", &*module.name);
 
     B::optimize(cgcx, prof, &shared_emitter, &mut module, &cgcx.module_config);
@@ -890,9 +880,7 @@ fn execute_optimize_work_item<B: WriteBackendMethods>(
 
     match lto_type {
         ComputedLtoType::No => {
-            wasi_progress(&format!("execute_optimize_work_item codegen {}", module.name));
             let module = B::codegen(cgcx, &prof, &shared_emitter, module, &cgcx.module_config);
-            wasi_progress(&format!("execute_optimize_work_item done {}", module.name));
             WorkItemResult::Finished(module)
         }
         ComputedLtoType::Thin => {
@@ -1061,7 +1049,6 @@ fn do_thin_lto<B: WriteBackendMethods>(
     check_lto_allowed(&cgcx, dcx);
 
     if !cgcx.parallel {
-        wasi_progress("do_thin_lto sequential");
         let mut compiled_modules = Vec::new();
         for (work, _) in generate_thin_lto_work::<B>(
             cgcx,
@@ -1342,7 +1329,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
         allocator_config: Arc<ModuleConfig>,
         mut allocator_module: Option<ModuleCodegen<B::Module>>,
     ) -> Self {
-        wasi_progress("SyncCodegen::new");
         let sess = tcx.sess;
         let prof = sess.prof.clone();
 
@@ -1405,7 +1391,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
 
         let mut allocator_compiled = None;
         let mut allocator_module = if let Some(mut allocator_module) = allocator_module {
-            wasi_progress("SyncCodegen allocator optimize");
             B::optimize(
                 &cgcx,
                 &prof,
@@ -1414,7 +1399,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
                 &allocator_config,
             );
             if cgcx.lto == Lto::No {
-                wasi_progress("SyncCodegen allocator codegen");
                 allocator_compiled = Some(B::codegen(
                     &cgcx,
                     &prof,
@@ -1450,7 +1434,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
     fn apply_work_item_result(&mut self, result: WorkItemResult<B>) {
         match result {
             WorkItemResult::Finished(compiled_module) => {
-                wasi_progress(&format!("compiled module {}", compiled_module.name));
                 self.compiled_modules.push(compiled_module);
             }
             WorkItemResult::NeedsFatLto(fat_lto_input) => {
@@ -1493,7 +1476,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
     }
 
     fn finish(mut self) -> Result<MaybeLtoModules<B>, ()> {
-        wasi_progress("SyncCodegen::finish start");
 
         if !self.needs_fat_lto.is_empty() {
             assert!(self.compiled_modules.is_empty());
@@ -1503,7 +1485,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
                 self.needs_fat_lto.push(FatLtoInput::InMemory(allocator_module));
             }
 
-            wasi_progress("SyncCodegen::finish fat LTO");
             return Ok(MaybeLtoModules::FatLto {
                 cgcx: self.cgcx,
                 exported_symbols_for_lto: self.exported_symbols_for_lto,
@@ -1518,7 +1499,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
             assert!(self.needs_fat_lto.is_empty());
 
             if self.cgcx.lto == Lto::ThinLocal {
-                wasi_progress("SyncCodegen::finish thin LTO");
                 self.compiled_modules.extend(do_thin_lto::<B>(
                     &self.cgcx,
                     &self.prof,
@@ -1536,7 +1516,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
 
         let allocator_module = self.allocator_compiled.or_else(|| {
             self.allocator_module.map(|allocator_module| {
-                wasi_progress("SyncCodegen allocator codegen (deferred)");
                 B::codegen(
                     &self.cgcx,
                     &self.prof,
@@ -1547,7 +1526,6 @@ impl<B: WriteBackendMethods> SyncCodegen<B> {
             })
         });
 
-        wasi_progress("SyncCodegen::finish done");
         Ok(MaybeLtoModules::NoLto(CompiledModules {
             modules: self.compiled_modules,
             allocator_module,
@@ -2431,7 +2409,6 @@ impl<B: WriteBackendMethods> Coordinator<B> {
 
     fn join(mut self) -> std::thread::Result<Result<MaybeLtoModules<B>, ()>> {
         if let Some(sync) = self.sync.take() {
-            wasi_progress("Coordinator::join sync path");
             return Ok(sync.into_inner().expect("sync coordinator poisoned").finish());
         }
         self.future.take().unwrap().join()
@@ -2465,7 +2442,6 @@ pub struct OngoingCodegen<B: WriteBackendMethods> {
 
 impl<B: WriteBackendMethods> OngoingCodegen<B> {
     pub fn join(self, sess: &Session) -> (CompiledModules, FxIndexMap<WorkProductId, WorkProduct>) {
-        wasi_progress("OngoingCodegen::join start");
         // In synchronous mode, the coordinator (and its SharedEmitter clone) lives in this
         // thread. Calling `check(..., true)` here would wait for channel closure before we've
         // run `coordinator.join()`, deadlocking. Do a non-blocking check first instead.
@@ -2566,9 +2542,7 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
 
         let work_products =
             copy_all_cgu_workproducts_to_incr_comp_cache_dir(sess, &compiled_modules);
-        wasi_progress("produce_final_output_artifacts");
         produce_final_output_artifacts(sess, &compiled_modules, &self.output_filenames);
-        wasi_progress("join complete");
 
         (compiled_modules, work_products)
     }
@@ -2608,7 +2582,6 @@ pub(crate) fn submit_codegened_module_to_llvm<B: WriteBackendMethods>(
 ) {
     let llvm_work_item = WorkItem::Optimize(module);
     if let Some(sync) = &coordinator.sync {
-        wasi_progress("submit_codegened_module_to_llvm");
         sync.lock().expect("sync coordinator poisoned").process_work_item(llvm_work_item);
         let _ = cost;
         return;

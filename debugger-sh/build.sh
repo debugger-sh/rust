@@ -61,6 +61,29 @@ install_rustc() {
   ./x.py install -j "$(nproc)"
 }
 
+prune_sysroot() {
+  local sysroot="$1"
+  local self_contained="$sysroot/lib/rustlib/wasm32-wasip1/lib/self-contained"
+  local objcopy=""
+  for cand in llvm-objcopy llvm-objcopy-14 /usr/bin/llvm-objcopy; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    objcopy="$cand"
+    break
+  done
+
+  if [[ -d "$self_contained" && -n "$objcopy" ]]; then
+    log "Stripping debug info from self-contained sysroot objects"
+    shopt -s nullglob
+    for f in "$self_contained"/*; do
+      "$objcopy" --strip-debug "$f" "$f"
+    done
+    shopt -u nullglob
+  fi
+
+  log "Removing .rmeta files from sysroot"
+  find "$sysroot/lib/rustlib" -name '*.rmeta' -delete
+}
+
 package_artifacts() {
   cd "$ROOT"
   mkdir -p "$BUILD_OUT"
@@ -84,6 +107,7 @@ package_artifacts() {
   staging="$(mktemp -d)"
   mkdir -p "$staging/sysroot/lib"
   cp -a dist/lib/rustlib "$staging/sysroot/lib/rustlib"
+  prune_sysroot "$staging/sysroot"
   if [[ -d dist/etc ]]; then
     mkdir -p "$staging/sysroot/etc"
     cp -a dist/etc "$staging/sysroot/etc"
