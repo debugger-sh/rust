@@ -95,6 +95,37 @@ link_ci_llvm() {
   fi
 }
 
+# The wasi-libc artifacts packaged with the release wasi-sdk
+# contain a generous amount of (unnecessary) debug info. Here we rebuild those
+# objects from source to strip their debug info.
+rebuild_wasi_libc_no_debug() {
+  local wasi_sysroot="$WASI_SDK_PATH/share/wasi-sysroot/lib/wasm32-wasip1"
+  local builddir srcdir outdir
+  builddir="$ROOT/build/wasi-libc-nodbg"
+  srcdir="$builddir/src"
+  outdir="$builddir/build/sysroot/lib/wasm32-wasip1"
+
+  log "Building wasi-libc without debug info"
+  rm -rf "$builddir"
+  git clone --depth 1 --branch wasi-sdk-32 https://github.com/WebAssembly/wasi-libc.git "$srcdir"
+
+  cmake -S "$srcdir" -B "$builddir/build" -G Ninja \
+    -DCMAKE_C_COMPILER="$WASI_SDK_PATH/bin/clang" \
+    -DCMAKE_AR="$WASI_SDK_PATH/bin/llvm-ar" \
+    -DCMAKE_RANLIB="$WASI_SDK_PATH/bin/llvm-ranlib" \
+    -DCMAKE_NM="$WASI_SDK_PATH/bin/llvm-nm" \
+    -DTARGET_TRIPLE=wasm32-wasip1 \
+    -DBUILD_SHARED=OFF \
+    -DBUILD_TESTS=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="-g0" \
+    -DCMAKE_ASM_FLAGS="-g0" \
+    -DWASI_SDK_VERSION="$(head -1 "$WASI_SDK_PATH/VERSION")"
+  cmake --build "$builddir/build" -j "$(nproc)"
+
+  cp -f "$outdir/libc.a" "$outdir/crt1-command.o" "$outdir/crt1-reactor.o" "$wasi_sysroot/"
+}
+
 install_rustc() {
   cd "$ROOT"
   local stage0
@@ -104,11 +135,6 @@ install_rustc() {
   git fetch origin --deepen=256 --no-recurse-submodules 2>/dev/null || true
   log "Installing rustc (wasm32-wasip1 host, LLVM codegen)"
   ./x.py install -j "$(nproc)"
-}
-
-prune_sysroot() {
-  # Keep .rmeta files: rustc.wasm needs them when compiling user crates (see test.sh).
-  :
 }
 
 optimize_rustc_wasm() {
@@ -149,7 +175,7 @@ package_artifacts() {
   staging="$(mktemp -d)"
   mkdir -p "$staging/sysroot/lib"
   cp -a dist/lib/rustlib "$staging/sysroot/lib/rustlib"
-  prune_sysroot "$staging/sysroot"
+
   if [[ -d dist/etc ]]; then
     mkdir -p "$staging/sysroot/etc"
     cp -a dist/etc "$staging/sysroot/etc"
@@ -167,6 +193,7 @@ main() {
   ensure_submodules
   build_llvm_wasm
   link_ci_llvm
+  rebuild_wasi_libc_no_debug
   install_rustc
   package_artifacts
   log "Build complete. Run debugger-sh/test.sh to validate artifacts."
