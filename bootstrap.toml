@@ -23,6 +23,7 @@ debug-assertions = false
 debug-logging = false
 frame-pointers = false
 backtrace-on-ice = false
+remap-debuginfo = true
 
 [build]
 docs = false
