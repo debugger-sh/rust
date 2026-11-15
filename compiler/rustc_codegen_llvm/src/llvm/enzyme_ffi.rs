@@ -96,6 +96,8 @@ pub(crate) mod Enzyme_AD {
     use rustc_session::filesearch;
     use rustc_span::bug;
 
+    #[cfg(not(any(unix, windows)))]
+    use crate::llvm::libloading;
     use super::{CConcreteType, CTypeTreeRef, Context};
     use crate::llvm::{self, EnzymeTypeTree};
 

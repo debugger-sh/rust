@@ -1425,7 +1425,8 @@ fn ice_path_with_config(config: Option<&UnstableOptions>) -> &'static Option<Pat
         };
         // Don't use a standard datetime format because Windows doesn't support `:` in paths
         let file_now = jiff::Zoned::now().strftime("%Y-%m-%dT%H_%M_%S");
-        let pid = std::process::id();
+        // WASI has no process IDs.
+        let pid = if cfg!(target_os = "wasi") { 0 } else { std::process::id() };
         path.push(format!("rustc-ice-{file_now}-{pid}.txt"));
         Some(path)
     })

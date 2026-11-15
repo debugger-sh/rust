@@ -131,7 +131,12 @@ impl ModuleConfig {
         let should_emit_obj = sess.opts.output_types.contains_key(&OutputType::Exe)
             || match kind {
                 ModuleKind::Regular => sess.opts.output_types.contains_key(&OutputType::Object),
-                ModuleKind::Allocator => false,
+                // A rustc hosted on WASI can't run a linker, so it also writes the allocator shim
+                // as an object, for programs to be linked separately.
+                ModuleKind::Allocator => {
+                    cfg!(target_os = "wasi")
+                        && sess.opts.output_types.contains_key(&OutputType::Object)
+                }
             };
 
         let emit_obj = if !should_emit_obj {
@@ -1233,7 +1238,7 @@ fn start_executing_work<B: WriteBackendMethods>(
     allocator_config: Arc<ModuleConfig>,
     mut allocator_module: Option<ModuleCodegen<B::Module>>,
     coordinator_send: Sender<Message<B>>,
-) -> thread::JoinHandle<Result<MaybeLtoModules<B>, ()>> {
+) -> CoordinatorJoin<B> {
     let sess = tcx.sess;
     let prof = sess.prof.clone();
 
@@ -1250,7 +1255,7 @@ fn start_executing_work<B: WriteBackendMethods>(
     // tokens before releasing them, so we can never accidentally release the last token
     // permanently held by rustc process.
     let parallel = match sess.opts.jobs.backend {
-        Some(n) if backend.supports_parallel() => Some(n),
+        Some(n) if backend.supports_parallel() && cfg!(not(target_os = "wasi")) => Some(n),
         _ => None,
     };
     let jobserver_helper = parallel.map(|_| {
@@ -1794,14 +1799,25 @@ fn start_executing_work<B: WriteBackendMethods>(
             }),
         }))
     };
-    return std::thread::Builder::new()
+    // Hosts without threads (such as WASI) run the coordinator once it's joined, after the main
+    // thread has sent it every message. The coordinator replays them as if the main thread had
+    // codegenned each unit instantly, and runs its work items as it spawns them (see `spawn`).
+    if cfg!(target_os = "wasi") {
+        return Box::new(move || Ok(f()));
+    }
+    let coordinator = std::thread::Builder::new()
         .name("coordinator".to_owned())
         .spawn(f)
         .expect("failed to spawn coordinator thread");
+    return Box::new(move || coordinator.join());
 
     // A heuristic that determines if we have enough LLVM WorkItems in the
     // queue so that the main thread can do LLVM work instead of codegen
     fn queue_full_enough(items_in_queue: usize, workers_running: usize) -> bool {
+        // Without threads, codegen is finished before any LLVM work starts (see above).
+        if cfg!(target_os = "wasi") {
+            return false;
+        }
         // This heuristic scales ahead-of-time codegen according to available
         // concurrency, as measured by `workers_running`. The idea is that the
         // more concurrency we have available, the more demand there will be for
@@ -1901,7 +1917,17 @@ fn spawn_work<'a, B: WriteBackendMethods>(
         };
         drop(coordinator_send.send(msg));
     };
-    std::thread::Builder::new().name(name).spawn(f).expect("failed to spawn work thread");
+    spawn(name, f);
+}
+
+/// Runs a work item on a new thread, or right away on hosts without threads (such as WASI): like a
+/// thread, it reports its result with a message, which the coordinator receives next.
+fn spawn(name: String, f: impl FnOnce() + Send + 'static) {
+    if cfg!(target_os = "wasi") {
+        f()
+    } else {
+        std::thread::Builder::new().name(name).spawn(f).expect("failed to spawn work thread");
+    }
 }
 
 fn spawn_thin_lto_work<B: WriteBackendMethods>(
@@ -1943,7 +1969,7 @@ fn spawn_thin_lto_work<B: WriteBackendMethods>(
         };
         drop(coordinator_send.send(msg));
     };
-    std::thread::Builder::new().name(name).spawn(f).expect("failed to spawn work thread");
+    spawn(name, f);
 }
 
 enum SharedEmitterMessage {
@@ -2091,16 +2117,19 @@ impl SharedEmitterMain {
     }
 }
 
+/// Waits for the coordinator to finish (or, without threads, runs it), returning its result.
+type CoordinatorJoin<B> = Box<dyn FnOnce() -> thread::Result<Result<MaybeLtoModules<B>, ()>> + Send>;
+
 pub struct Coordinator<B: WriteBackendMethods> {
     sender: Sender<Message<B>>,
-    future: Option<thread::JoinHandle<Result<MaybeLtoModules<B>, ()>>>,
+    future: Option<CoordinatorJoin<B>>,
     // Only used for the Message type.
     phantom: PhantomData<B>,
 }
 
 impl<B: WriteBackendMethods> Coordinator<B> {
     fn join(mut self) -> std::thread::Result<Result<MaybeLtoModules<B>, ()>> {
-        self.future.take().unwrap().join()
+        self.future.take().unwrap()()
     }
 }
 
@@ -2110,7 +2139,7 @@ impl<B: WriteBackendMethods> Drop for Coordinator<B> {
             // If we haven't joined yet, signal to the coordinator that it should spawn no more
             // work, and wait for worker threads to finish.
             drop(self.sender.send(Message::CodegenAborted::<B>));
-            drop(future.join());
+            drop(future());
         }
     }
 }
@@ -2133,9 +2162,16 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
         incr_comp_session: Option<&IncrCompSession>,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
-        self.shared_emitter_main.check(sess, true);
+        // Without threads, the coordinator only runs once it's joined (see `Coordinator`), so its
+        // diagnostics can only be received after that.
+        let threads = cfg!(not(target_os = "wasi"));
+        self.shared_emitter_main.check(sess, threads);
+        let joined = sess.time("join_worker_thread", || self.coordinator.join());
+        if !threads {
+            self.shared_emitter_main.check(sess, true);
+        }
 
-        let maybe_lto_modules = sess.time("join_worker_thread", || match self.coordinator.join() {
+        let maybe_lto_modules = match joined {
             Ok(Ok(maybe_lto_modules)) => maybe_lto_modules,
             Ok(Err(())) => {
                 sess.dcx().abort_if_errors();
@@ -2144,7 +2180,7 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
             Err(_) => {
                 bug!("panic during codegen/LLVM phase");
             }
-        });
+        };
 
         sess.dcx().abort_if_errors();
 
@@ -2223,6 +2259,10 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
     }
 
     pub(crate) fn wait_for_signal_to_codegen_item(&self) {
+        // Without threads, the coordinator only runs once codegen is done (see `Coordinator`).
+        if cfg!(target_os = "wasi") {
+            return;
+        }
         match self.codegen_worker_receive.recv() {
             Ok(CguMessage) => {
                 // Ok to proceed.

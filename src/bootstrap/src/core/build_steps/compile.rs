@@ -1437,8 +1437,14 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
         cargo.env("LLVM_OFFLOAD", "1");
     }
 
-    // This always has to be the host LLVM config, because it is executed by rustc_llvm
-    cargo.env("LLVM_CONFIG", builder.host_llvm_config());
+    // This always has to be the host LLVM config, because it is executed by rustc_llvm, except for
+    // WASI hosts: an LLVM for them can't be configured like the host's (which needs the host's
+    // backend), so their llvm-config, if provided, is one that runs on the host to describe it.
+    if target.contains("wasi") && llvm_output.kind() == LlvmKind::External {
+        cargo.env("LLVM_CONFIG", llvm_output.llvm_config());
+    } else {
+        cargo.env("LLVM_CONFIG", builder.host_llvm_config());
+    }
 
     // Some LLVM linker flags (-L and -l) may be needed to link `rustc_llvm`. Its build script
     // expects these to be passed via the `LLVM_LINKER_FLAGS` env variable, separated by

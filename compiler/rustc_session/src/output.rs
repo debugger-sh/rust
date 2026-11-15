@@ -45,6 +45,8 @@ pub fn check_file_is_writeable(file: &Path, sess: &Session) {
 fn is_writeable(p: &Path) -> bool {
     match p.metadata() {
         Err(..) => true,
+        // WASI has no permissions, so whether a file is read-only isn't known there.
+        Ok(_) if cfg!(target_os = "wasi") => true,
         Ok(m) => !m.permissions().readonly(),
     }
 }

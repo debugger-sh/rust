@@ -14,6 +14,8 @@ use rustc_session::config::host_tuple;
 use rustc_session::filesearch;
 
 use crate::llvm;
+#[cfg(not(any(unix, windows)))]
+use crate::llvm::libloading;
 
 pub(crate) struct RustOffloadWrapper {
     LLVMRustBundleImages: LLVMRustBundleImagesFn,

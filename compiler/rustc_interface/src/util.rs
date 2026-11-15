@@ -179,6 +179,13 @@ fn run_in_thread_with_globals<F: FnOnce(CurrentGcx) -> R + Send, R: Send>(
     extra_symbols: &[&'static str],
     f: F,
 ) -> R {
+    // Hosts without threads (such as WASI) run on the main thread, whose stack size is set when
+    // rustc is linked.
+    if cfg!(target_os = "wasi") {
+        let run = || f(CurrentGcx::new());
+        return rustc_span::create_session_globals_then(edition, extra_symbols, Some(sm_inputs), run);
+    }
+
     // The "thread pool" is a single spawned thread in the non-parallel
     // compiler. We run on a spawned thread instead of the main thread (a) to
     // provide control over the stack size, and (b) to increase similarity with

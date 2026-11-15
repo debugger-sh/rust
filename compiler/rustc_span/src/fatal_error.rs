@@ -13,6 +13,11 @@ impl !Send for FatalError {}
 
 impl FatalError {
     pub fn raise(self) -> ! {
+        // On WASI, rustc is built with panic=abort, so unwinding would trap instead of reaching
+        // `catch_fatal_errors` in the driver. The errors have been reported, so just exit.
+        if cfg!(target_os = "wasi") {
+            std::process::exit(1);
+        }
         std::panic::resume_unwind(Box::new(FatalErrorMarker))
     }
 }

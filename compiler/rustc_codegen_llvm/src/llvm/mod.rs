@@ -26,6 +26,46 @@ pub(crate) mod offload_ffi;
 pub(crate) use self::enzyme_ffi::*;
 pub(crate) use self::offload_ffi::*;
 
+/// A stand-in for `libloading` on hosts that can't load dynamic libraries (such as WASI), on
+/// which loading always fails, so that Enzyme and offloading report that they're unavailable.
+#[cfg(not(any(unix, windows)))]
+pub(crate) mod libloading {
+    use std::ffi::{OsStr, c_void};
+    use std::marker::PhantomData;
+    use std::ops::Deref;
+
+    #[derive(Debug)]
+    pub(crate) struct Error;
+
+    pub(crate) enum Library {}
+
+    pub(crate) struct Symbol<'lib, T>(&'lib Library, PhantomData<T>);
+
+    impl Library {
+        pub(crate) unsafe fn new(_path: impl AsRef<OsStr>) -> Result<Library, Error> {
+            Err(Error)
+        }
+
+        pub(crate) unsafe fn get<T>(&self, _symbol: &[u8]) -> Result<Symbol<'_, T>, Error> {
+            match *self {}
+        }
+    }
+
+    impl<T> Symbol<'_, T> {
+        pub(crate) fn try_as_raw_ptr(self) -> Option<*mut c_void> {
+            match *self.0 {}
+        }
+    }
+
+    impl<T> Deref for Symbol<'_, T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            match *self.0 {}
+        }
+    }
+}
+
 impl LLVMRustResult {
     pub(crate) fn into_result(self) -> Result<(), ()> {
         match self {

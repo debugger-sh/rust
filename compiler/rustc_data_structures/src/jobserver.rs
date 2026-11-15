@@ -109,6 +109,10 @@ impl Proxy {
             wake_pending: Condvar::new(),
             helper: OnceLock::new(),
         });
+        // Hosts without threads (such as WASI) have no helper thread: see `acquire_thread`.
+        if cfg!(target_os = "wasi") {
+            return proxy;
+        }
         let proxy_ = Arc::clone(&proxy);
         let helper = proxy
             .client
@@ -145,6 +149,9 @@ impl Proxy {
             // No threads are doing any active work, but we are still holding the last token.
             // Give that token to the current thread.
             assert_eq!(data.pending, 0);
+            data.used += 1;
+        } else if self.helper.get().is_none() {
+            // Without threads, nothing else can be doing work, so there is nothing to wait for.
             data.used += 1;
         } else {
             // Request a token from the helper thread, this is a non-blocking operation.
